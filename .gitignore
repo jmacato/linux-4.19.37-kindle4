@@ -14,6 +14,7 @@
 *.asn1.[ch]
 *.bz2
 *.c.[012]*.*
+*.dt.yaml
 *.dtb
 *.dtb.S
 *.dwo
