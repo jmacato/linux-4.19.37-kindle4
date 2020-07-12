@@ -1,18 +1,9 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * Ingenic SoC CGU driver
  *
  * Copyright (c) 2013-2015 Imagination Technologies
  * Author: Paul Burton <paul.burton@mips.com>
- *
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU General Public License as
- * published by the Free Software Foundation; either version 2 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
  */
 
 #include <linux/bitops.h>
@@ -20,6 +11,7 @@
 #include <linux/clk-provider.h>
 #include <linux/clkdev.h>
 #include <linux/delay.h>
+#include <linux/io.h>
 #include <linux/math64.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
@@ -84,16 +76,13 @@ ingenic_pll_recalc_rate(struct clk_hw *hw, unsigned long parent_rate)
 	const struct ingenic_cgu_pll_info *pll_info;
 	unsigned m, n, od_enc, od;
 	bool bypass;
-	unsigned long flags;
 	u32 ctl;
 
 	clk_info = &cgu->clock_info[ingenic_clk->idx];
 	BUG_ON(clk_info->type != CGU_CLK_PLL);
 	pll_info = &clk_info->pll;
 
-	spin_lock_irqsave(&cgu->lock, flags);
 	ctl = readl(cgu->base + pll_info->reg);
-	spin_unlock_irqrestore(&cgu->lock, flags);
 
 	m = (ctl >> pll_info->m_shift) & GENMASK(pll_info->m_bits - 1, 0);
 	m += pll_info->m_offset;
@@ -101,6 +90,9 @@ ingenic_pll_recalc_rate(struct clk_hw *hw, unsigned long parent_rate)
 	n += pll_info->n_offset;
 	od_enc = ctl >> pll_info->od_shift;
 	od_enc &= GENMASK(pll_info->od_bits - 1, 0);
+
+	ctl = readl(cgu->base + pll_info->bypass_reg);
+
 	bypass = !pll_info->no_bypass_bit &&
 		 !!(ctl & BIT(pll_info->bypass_bit));
 
@@ -114,7 +106,8 @@ ingenic_pll_recalc_rate(struct clk_hw *hw, unsigned long parent_rate)
 	BUG_ON(od == pll_info->od_max);
 	od++;
 
-	return div_u64((u64)parent_rate * m, n * od);
+	return div_u64((u64)parent_rate * m * pll_info->rate_multiplier,
+		n * od);
 }
 
 static unsigned long
@@ -147,7 +140,8 @@ ingenic_pll_calc(const struct ingenic_cgu_clk_info *clk_info,
 	if (pod)
 		*pod = od;
 
-	return div_u64((u64)parent_rate * m, n * od);
+	return div_u64((u64)parent_rate * m * pll_info->rate_multiplier,
+		n * od);
 }
 
 static inline const struct ingenic_cgu_clk_info *to_clk_info(
@@ -220,9 +214,14 @@ static int ingenic_pll_enable(struct clk_hw *hw)
 	u32 ctl;
 
 	spin_lock_irqsave(&cgu->lock, flags);
-	ctl = readl(cgu->base + pll_info->reg);
+	ctl = readl(cgu->base + pll_info->bypass_reg);
 
 	ctl &= ~BIT(pll_info->bypass_bit);
+
+	writel(ctl, cgu->base + pll_info->bypass_reg);
+
+	ctl = readl(cgu->base + pll_info->reg);
+
 	ctl |= BIT(pll_info->enable_bit);
 
 	writel(ctl, cgu->base + pll_info->reg);
@@ -267,12 +266,9 @@ static int ingenic_pll_is_enabled(struct clk_hw *hw)
 	struct ingenic_cgu *cgu = ingenic_clk->cgu;
 	const struct ingenic_cgu_clk_info *clk_info = to_clk_info(ingenic_clk);
 	const struct ingenic_cgu_pll_info *pll_info = &clk_info->pll;
-	unsigned long flags;
 	u32 ctl;
 
-	spin_lock_irqsave(&cgu->lock, flags);
 	ctl = readl(cgu->base + pll_info->reg);
-	spin_unlock_irqrestore(&cgu->lock, flags);
 
 	return !!(ctl & BIT(pll_info->enable_bit));
 }
@@ -383,8 +379,11 @@ ingenic_clk_recalc_rate(struct clk_hw *hw, unsigned long parent_rate)
 		div_reg = readl(cgu->base + clk_info->div.reg);
 		div = (div_reg >> clk_info->div.shift) &
 		      GENMASK(clk_info->div.bits - 1, 0);
-		div += 1;
-		div *= clk_info->div.div;
+
+		if (clk_info->div.div_table)
+			div = clk_info->div.div_table[div];
+		else
+			div = (div + 1) * clk_info->div.div;
 
 		rate /= div;
 	} else if (clk_info->type & CGU_CLK_FIXDIV) {
@@ -394,16 +393,37 @@ ingenic_clk_recalc_rate(struct clk_hw *hw, unsigned long parent_rate)
 	return rate;
 }
 
+static unsigned int
+ingenic_clk_calc_hw_div(const struct ingenic_cgu_clk_info *clk_info,
+			unsigned int div)
+{
+	unsigned int i;
+
+	for (i = 0; i < (1 << clk_info->div.bits)
+				&& clk_info->div.div_table[i]; i++) {
+		if (clk_info->div.div_table[i] >= div)
+			return i;
+	}
+
+	return i - 1;
+}
+
 static unsigned
 ingenic_clk_calc_div(const struct ingenic_cgu_clk_info *clk_info,
 		     unsigned long parent_rate, unsigned long req_rate)
 {
-	unsigned div;
+	unsigned int div, hw_div;
 
 	/* calculate the divide */
 	div = DIV_ROUND_UP(parent_rate, req_rate);
 
-	/* and impose hardware constraints */
+	if (clk_info->div.div_table) {
+		hw_div = ingenic_clk_calc_hw_div(clk_info, div);
+
+		return clk_info->div.div_table[hw_div];
+	}
+
+	/* Impose hardware constraints */
 	div = min_t(unsigned, div, 1 << clk_info->div.bits);
 	div = max_t(unsigned, div, 1);
 
@@ -446,7 +466,7 @@ ingenic_clk_set_rate(struct clk_hw *hw, unsigned long req_rate,
 	const struct ingenic_cgu_clk_info *clk_info;
 	const unsigned timeout = 100;
 	unsigned long rate, flags;
-	unsigned div, i;
+	unsigned int hw_div, div, i;
 	u32 reg, mask;
 	int ret = 0;
 
@@ -459,13 +479,18 @@ ingenic_clk_set_rate(struct clk_hw *hw, unsigned long req_rate,
 		if (rate != req_rate)
 			return -EINVAL;
 
+		if (clk_info->div.div_table)
+			hw_div = ingenic_clk_calc_hw_div(clk_info, div);
+		else
+			hw_div = ((div / clk_info->div.div) - 1);
+
 		spin_lock_irqsave(&cgu->lock, flags);
 		reg = readl(cgu->base + clk_info->div.reg);
 
 		/* update the divide */
 		mask = GENMASK(clk_info->div.bits - 1, 0);
 		reg &= ~(mask << clk_info->div.shift);
-		reg |= ((div / clk_info->div.div) - 1) << clk_info->div.shift;
+		reg |= hw_div << clk_info->div.shift;
 
 		/* clear the stop bit */
 		if (clk_info->div.stop_bit != -1)
@@ -541,16 +566,12 @@ static int ingenic_clk_is_enabled(struct clk_hw *hw)
 	struct ingenic_clk *ingenic_clk = to_ingenic_clk(hw);
 	struct ingenic_cgu *cgu = ingenic_clk->cgu;
 	const struct ingenic_cgu_clk_info *clk_info;
-	unsigned long flags;
 	int enabled = 1;
 
 	clk_info = &cgu->clock_info[ingenic_clk->idx];
 
-	if (clk_info->type & CGU_CLK_GATE) {
-		spin_lock_irqsave(&cgu->lock, flags);
+	if (clk_info->type & CGU_CLK_GATE)
 		enabled = !ingenic_cgu_gate_get(cgu, &clk_info->gate);
-		spin_unlock_irqrestore(&cgu->lock, flags);
-	}
 
 	return enabled;
 }

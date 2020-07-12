@@ -96,6 +96,7 @@ struct aeu_invert_reg_bit {
 #define ATTENTION_BB(value)             (value << ATTENTION_BB_SHIFT)
 #define ATTENTION_BB_DIFFERENT          BIT(23)
 
+#define ATTENTION_CLEAR_ENABLE          BIT(28)
 	unsigned int flags;
 
 	/* Callback to call if attention will be triggered */
@@ -363,6 +364,21 @@ static int qed_pglueb_rbc_attn_cb(struct qed_hwfn *p_hwfn)
 	return qed_pglueb_rbc_attn_handler(p_hwfn, p_hwfn->p_dpc_ptt);
 }
 
+static int qed_fw_assertion(struct qed_hwfn *p_hwfn)
+{
+	qed_hw_err_notify(p_hwfn, p_hwfn->p_dpc_ptt, QED_HW_ERR_FW_ASSERT,
+			  "FW assertion!\n");
+
+	return -EINVAL;
+}
+
+static int qed_general_attention_35(struct qed_hwfn *p_hwfn)
+{
+	DP_INFO(p_hwfn, "General attention 35!\n");
+
+	return 0;
+}
+
 #define QED_DORQ_ATTENTION_REASON_MASK  (0xfffff)
 #define QED_DORQ_ATTENTION_OPAQUE_MASK  (0xffff)
 #define QED_DORQ_ATTENTION_OPAQUE_SHIFT (0x0)
@@ -605,13 +621,15 @@ static struct aeu_invert_reg aeu_descs[NUM_ATTN_REGS] = {
 
 	{
 		{       /* After Invert 4 */
-			{"General Attention 32", ATTENTION_SINGLE,
-			 NULL, MAX_BLOCK_ID},
+			{"General Attention 32", ATTENTION_SINGLE |
+			 ATTENTION_CLEAR_ENABLE, qed_fw_assertion,
+			 MAX_BLOCK_ID},
 			{"General Attention %d",
 			 (2 << ATTENTION_LENGTH_SHIFT) |
 			 (33 << ATTENTION_OFFSET_SHIFT), NULL, MAX_BLOCK_ID},
-			{"General Attention 35", ATTENTION_SINGLE,
-			 NULL, MAX_BLOCK_ID},
+			{"General Attention 35", ATTENTION_SINGLE |
+			 ATTENTION_CLEAR_ENABLE, qed_general_attention_35,
+			 MAX_BLOCK_ID},
 			{"NWS Parity",
 			 ATTENTION_PAR | ATTENTION_BB_DIFFERENT |
 			 ATTENTION_BB(AEU_INVERT_REG_SPECIAL_CNIG_0),
@@ -814,17 +832,11 @@ static inline u16 qed_attn_update_idx(struct qed_hwfn *p_hwfn,
 {
 	u16 rc = 0, index;
 
-	/* Make certain HW write took affect */
-	mmiowb();
-
 	index = le16_to_cpu(p_sb_desc->sb_attn->sb_index);
 	if (p_sb_desc->index != index) {
 		p_sb_desc->index	= index;
 		rc		      = QED_SB_ATT_IDX;
 	}
-
-	/* Make certain we got a consistent view with HW */
-	mmiowb();
 
 	return rc;
 }
@@ -933,9 +945,12 @@ qed_int_deassertion_aeu_bit(struct qed_hwfn *p_hwfn,
 		qed_int_attn_print(p_hwfn, p_aeu->block_index,
 				   ATTN_TYPE_INTERRUPT, !b_fatal);
 
-
-	/* If the attention is benign, no need to prevent it */
-	if (!rc)
+	/* Reach assertion if attention is fatal */
+	if (b_fatal)
+		qed_hw_err_notify(p_hwfn, p_hwfn->p_dpc_ptt, QED_HW_ERR_HW_ATTN,
+				  "`%s': Fatal attention\n",
+				  p_bit_name);
+	else /* If the attention is benign, no need to prevent it */
 		goto out;
 
 	/* Prevent this Attention from being asserted in the future */
@@ -1099,7 +1114,7 @@ static int qed_int_deassertion(struct qed_hwfn  *p_hwfn,
 						snprintf(bit_name, 30,
 							 p_aeu->bit_name, num);
 					else
-						strncpy(bit_name,
+						strlcpy(bit_name,
 							p_aeu->bit_name, 30);
 
 					/* We now need to pass bitmask in its
@@ -1213,7 +1228,6 @@ static void qed_sb_ack_attn(struct qed_hwfn *p_hwfn,
 	/* Both segments (interrupts & acks) are written to same place address;
 	 * Need to guarantee all commands will be received (in-order) by HW.
 	 */
-	mmiowb();
 	barrier();
 }
 
@@ -1515,10 +1529,10 @@ void qed_int_cau_conf_sb(struct qed_hwfn *p_hwfn,
 
 		qed_dmae_host2grc(p_hwfn, p_ptt, (u64)(uintptr_t)&phys_addr,
 				  CAU_REG_SB_ADDR_MEMORY +
-				  igu_sb_id * sizeof(u64), 2, 0);
+				  igu_sb_id * sizeof(u64), 2, NULL);
 		qed_dmae_host2grc(p_hwfn, p_ptt, (u64)(uintptr_t)&sb_entry,
 				  CAU_REG_SB_VAR_MEMORY +
-				  igu_sb_id * sizeof(u64), 2, 0);
+				  igu_sb_id * sizeof(u64), 2, NULL);
 	} else {
 		/* Initialize Status Block Address */
 		STORE_RT_REG_AGG(p_hwfn,
@@ -1848,9 +1862,6 @@ static void qed_int_igu_enable_attn(struct qed_hwfn *p_hwfn,
 	qed_wr(p_hwfn, p_ptt, IGU_REG_TRAILING_EDGE_LATCH, 0xfff);
 	qed_wr(p_hwfn, p_ptt, IGU_REG_ATTENTION_ENABLE, 0xfff);
 
-	/* Flush the writes to IGU */
-	mmiowb();
-
 	/* Unmask AEU signals toward IGU */
 	qed_wr(p_hwfn, p_ptt, MISC_REG_AEU_MASK_ATTN_IGU, 0xff);
 }
@@ -1913,9 +1924,6 @@ static void qed_int_igu_cleanup_sb(struct qed_hwfn *p_hwfn,
 	barrier();
 
 	qed_wr(p_hwfn, p_ptt, IGU_REG_COMMAND_REG_CTRL, cmd_ctrl);
-
-	/* Flush the write to IGU */
-	mmiowb();
 
 	/* calculate where to read the status bit from */
 	sb_bit = 1 << (igu_sb_id % 32);
@@ -2362,6 +2370,11 @@ void qed_int_disable_post_isr_release(struct qed_dev *cdev)
 		cdev->hwfns[i].b_int_requested = false;
 }
 
+void qed_int_attn_clr_enable(struct qed_dev *cdev, bool clr_enable)
+{
+	cdev->attn_clr_en = clr_enable;
+}
+
 int qed_int_set_timer_res(struct qed_hwfn *p_hwfn, struct qed_ptt *p_ptt,
 			  u8 timer_res, u16 sb_id, bool tx)
 {
@@ -2375,7 +2388,7 @@ int qed_int_set_timer_res(struct qed_hwfn *p_hwfn, struct qed_ptt *p_ptt,
 
 	rc = qed_dmae_grc2host(p_hwfn, p_ptt, CAU_REG_SB_VAR_MEMORY +
 			       sb_id * sizeof(u64),
-			       (u64)(uintptr_t)&sb_entry, 2, 0);
+			       (u64)(uintptr_t)&sb_entry, 2, NULL);
 	if (rc) {
 		DP_ERR(p_hwfn, "dmae_grc2host failed %d\n", rc);
 		return rc;
@@ -2389,7 +2402,7 @@ int qed_int_set_timer_res(struct qed_hwfn *p_hwfn, struct qed_ptt *p_ptt,
 	rc = qed_dmae_host2grc(p_hwfn, p_ptt,
 			       (u64)(uintptr_t)&sb_entry,
 			       CAU_REG_SB_VAR_MEMORY +
-			       sb_id * sizeof(u64), 2, 0);
+			       sb_id * sizeof(u64), 2, NULL);
 	if (rc) {
 		DP_ERR(p_hwfn, "dmae_host2grc failed %d\n", rc);
 		return rc;

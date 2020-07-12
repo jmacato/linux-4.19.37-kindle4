@@ -1,21 +1,8 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * PTP 1588 clock for Freescale QorIQ 1588 timer
  *
  * Copyright (C) 2010 OMICRON electronics GmbH
- *
- *  This program is free software; you can redistribute it and/or modify
- *  it under the terms of the GNU General Public License as published by
- *  the Free Software Foundation; either version 2 of the License, or
- *  (at your option) any later version.
- *
- *  This program is distributed in the hope that it will be useful,
- *  but WITHOUT ANY WARRANTY; without even the implied warranty of
- *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *  GNU General Public License for more details.
- *
- *  You should have received a copy of the GNU General Public License
- *  along with this program; if not, write to the Free Software
- *  Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
  */
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
@@ -87,14 +74,13 @@ static void set_fipers(struct ptp_qoriq *ptp_qoriq)
 	ptp_qoriq->write(&regs->fiper_regs->tmr_fiper2, ptp_qoriq->tmr_fiper2);
 }
 
-static int extts_clean_up(struct ptp_qoriq *ptp_qoriq, int index,
-			  bool update_event)
+int extts_clean_up(struct ptp_qoriq *ptp_qoriq, int index, bool update_event)
 {
 	struct ptp_qoriq_registers *regs = &ptp_qoriq->regs;
 	struct ptp_clock_event event;
 	void __iomem *reg_etts_l;
 	void __iomem *reg_etts_h;
-	u32 valid, stat, lo, hi;
+	u32 valid, lo, hi;
 
 	switch (index) {
 	case 0:
@@ -114,6 +100,10 @@ static int extts_clean_up(struct ptp_qoriq *ptp_qoriq, int index,
 	event.type = PTP_CLOCK_EXTTS;
 	event.index = index;
 
+	if (ptp_qoriq->extts_fifo_support)
+		if (!(ptp_qoriq->read(&regs->ctrl_regs->tmr_stat) & valid))
+			return 0;
+
 	do {
 		lo = ptp_qoriq->read(reg_etts_l);
 		hi = ptp_qoriq->read(reg_etts_h);
@@ -124,11 +114,13 @@ static int extts_clean_up(struct ptp_qoriq *ptp_qoriq, int index,
 			ptp_clock_event(ptp_qoriq->clock, &event);
 		}
 
-		stat = ptp_qoriq->read(&regs->ctrl_regs->tmr_stat);
-	} while (ptp_qoriq->extts_fifo_support && (stat & valid));
+		if (!ptp_qoriq->extts_fifo_support)
+			break;
+	} while (ptp_qoriq->read(&regs->ctrl_regs->tmr_stat) & valid);
 
 	return 0;
 }
+EXPORT_SYMBOL_GPL(extts_clean_up);
 
 /*
  * Interrupt service routine
@@ -139,8 +131,7 @@ irqreturn_t ptp_qoriq_isr(int irq, void *priv)
 	struct ptp_qoriq *ptp_qoriq = priv;
 	struct ptp_qoriq_registers *regs = &ptp_qoriq->regs;
 	struct ptp_clock_event event;
-	u64 ns;
-	u32 ack = 0, lo, hi, mask, val, irqs;
+	u32 ack = 0, mask, val, irqs;
 
 	spin_lock(&ptp_qoriq->lock);
 
@@ -159,32 +150,6 @@ irqreturn_t ptp_qoriq_isr(int irq, void *priv)
 	if (irqs & ETS2) {
 		ack |= ETS2;
 		extts_clean_up(ptp_qoriq, 1, true);
-	}
-
-	if (irqs & ALM2) {
-		ack |= ALM2;
-		if (ptp_qoriq->alarm_value) {
-			event.type = PTP_CLOCK_ALARM;
-			event.index = 0;
-			event.timestamp = ptp_qoriq->alarm_value;
-			ptp_clock_event(ptp_qoriq->clock, &event);
-		}
-		if (ptp_qoriq->alarm_interval) {
-			ns = ptp_qoriq->alarm_value + ptp_qoriq->alarm_interval;
-			hi = ns >> 32;
-			lo = ns & 0xffffffff;
-			ptp_qoriq->write(&regs->alarm_regs->tmr_alarm2_l, lo);
-			ptp_qoriq->write(&regs->alarm_regs->tmr_alarm2_h, hi);
-			ptp_qoriq->alarm_value = ns;
-		} else {
-			spin_lock(&ptp_qoriq->lock);
-			mask = ptp_qoriq->read(&regs->ctrl_regs->tmr_temask);
-			mask &= ~ALM2EN;
-			ptp_qoriq->write(&regs->ctrl_regs->tmr_temask, mask);
-			spin_unlock(&ptp_qoriq->lock);
-			ptp_qoriq->alarm_value = 0;
-			ptp_qoriq->alarm_interval = 0;
-		}
 	}
 
 	if (irqs & PP1) {
@@ -467,6 +432,9 @@ int ptp_qoriq_init(struct ptp_qoriq *ptp_qoriq, void __iomem *base,
 	unsigned long flags;
 	u32 tmr_ctrl;
 
+	if (!node)
+		return -ENODEV;
+
 	ptp_qoriq->base = base;
 	ptp_qoriq->caps = *caps;
 
@@ -517,6 +485,8 @@ int ptp_qoriq_init(struct ptp_qoriq *ptp_qoriq, void __iomem *base,
 		ptp_qoriq->regs.etts_regs = base + ETTS_REGS_OFFSET;
 	}
 
+	spin_lock_init(&ptp_qoriq->lock);
+
 	ktime_get_real_ts64(&now);
 	ptp_qoriq_settime(&ptp_qoriq->caps, &now);
 
@@ -524,7 +494,6 @@ int ptp_qoriq_init(struct ptp_qoriq *ptp_qoriq, void __iomem *base,
 	  (ptp_qoriq->tclk_period & TCLK_PERIOD_MASK) << TCLK_PERIOD_SHIFT |
 	  (ptp_qoriq->cksel & CKSEL_MASK) << CKSEL_SHIFT;
 
-	spin_lock_init(&ptp_qoriq->lock);
 	spin_lock_irqsave(&ptp_qoriq->lock, flags);
 
 	regs = &ptp_qoriq->regs;

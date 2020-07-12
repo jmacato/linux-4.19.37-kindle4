@@ -1,3 +1,6 @@
+.. SPDX-License-Identifier: GPL-2.0
+.. include:: <isonum.txt>
+
 .. |struct cpuidle_governor| replace:: :c:type:`struct cpuidle_governor <cpuidle_governor>`
 .. |struct cpuidle_device| replace:: :c:type:`struct cpuidle_device <cpuidle_device>`
 .. |struct cpuidle_driver| replace:: :c:type:`struct cpuidle_driver <cpuidle_driver>`
@@ -7,9 +10,9 @@
 CPU Idle Time Management
 ========================
 
-::
+:Copyright: |copy| 2019 Intel Corporation
 
- Copyright (c) 2019 Intel Corp., Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+:Author: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
 
 
 CPU Idle Time Management Subsystem
@@ -65,9 +68,8 @@ only one in the list (that is, the list was empty before) or the value of its
 governor currently in use, or the name of the new governor was passed to the
 kernel as the value of the ``cpuidle.governor=`` command line parameter, the new
 governor will be used from that point on (there can be only one ``CPUIdle``
-governor in use at a time).  Also, if ``cpuidle_sysfs_switch`` is passed to the
-kernel in the command line, user space can choose the ``CPUIdle`` governor to
-use at run time via ``sysfs``.
+governor in use at a time).  Also, user space can choose the ``CPUIdle``
+governor to use at run time via ``sysfs``.
 
 Once registered, ``CPUIdle`` governors cannot be unregistered, so it is not
 practical to put them into loadable kernel modules.

@@ -58,16 +58,13 @@ static struct ch_tc_pedit_fields pedits[] = {
 	PEDIT_FIELDS(IP6_, DST_63_32, 4, nat_lip, 4),
 	PEDIT_FIELDS(IP6_, DST_95_64, 4, nat_lip, 8),
 	PEDIT_FIELDS(IP6_, DST_127_96, 4, nat_lip, 12),
-	PEDIT_FIELDS(TCP_, SPORT, 2, nat_fport, 0),
-	PEDIT_FIELDS(TCP_, DPORT, 2, nat_lport, 0),
-	PEDIT_FIELDS(UDP_, SPORT, 2, nat_fport, 0),
-	PEDIT_FIELDS(UDP_, DPORT, 2, nat_lport, 0),
 };
 
 static struct ch_tc_flower_entry *allocate_flower_entry(void)
 {
 	struct ch_tc_flower_entry *new = kzalloc(sizeof(*new), GFP_KERNEL);
-	spin_lock_init(&new->lock);
+	if (new)
+		spin_lock_init(&new->lock);
 	return new;
 }
 
@@ -80,10 +77,10 @@ static struct ch_tc_flower_entry *ch_flower_lookup(struct adapter *adap,
 }
 
 static void cxgb4_process_flow_match(struct net_device *dev,
-				     struct tc_cls_flower_offload *cls,
+				     struct flow_cls_offload *cls,
 				     struct ch_filter_specification *fs)
 {
-	struct flow_rule *rule = tc_cls_flower_offload_flow_rule(cls);
+	struct flow_rule *rule = flow_cls_offload_flow_rule(cls);
 	u16 addr_type = 0;
 
 	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_CONTROL)) {
@@ -155,14 +152,14 @@ static void cxgb4_process_flow_match(struct net_device *dev,
 		struct flow_match_ports match;
 
 		flow_rule_match_ports(rule, &match);
-		fs->val.lport = cpu_to_be16(match.key->dst);
-		fs->mask.lport = cpu_to_be16(match.mask->dst);
-		fs->val.fport = cpu_to_be16(match.key->src);
-		fs->mask.fport = cpu_to_be16(match.mask->src);
+		fs->val.lport = be16_to_cpu(match.key->dst);
+		fs->mask.lport = be16_to_cpu(match.mask->dst);
+		fs->val.fport = be16_to_cpu(match.key->src);
+		fs->mask.fport = be16_to_cpu(match.mask->src);
 
 		/* also initialize nat_lport/fport to same values */
-		fs->nat_lport = cpu_to_be16(match.key->dst);
-		fs->nat_fport = cpu_to_be16(match.key->src);
+		fs->nat_lport = fs->val.lport;
+		fs->nat_fport = fs->val.fport;
 	}
 
 	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_IP)) {
@@ -197,6 +194,9 @@ static void cxgb4_process_flow_match(struct net_device *dev,
 		fs->val.ivlan = vlan_tci;
 		fs->mask.ivlan = vlan_tci_mask;
 
+		fs->val.ivlan_vld = 1;
+		fs->mask.ivlan_vld = 1;
+
 		/* Chelsio adapters use ivlan_vld bit to match vlan packets
 		 * as 802.1Q. Also, when vlan tag is present in packets,
 		 * ethtype match is used then to match on ethtype of inner
@@ -207,8 +207,6 @@ static void cxgb4_process_flow_match(struct net_device *dev,
 		 * ethtype value with ethtype of inner header.
 		 */
 		if (fs->val.ethtype == ETH_P_8021Q) {
-			fs->val.ivlan_vld = 1;
-			fs->mask.ivlan_vld = 1;
 			fs->val.ethtype = 0;
 			fs->mask.ethtype = 0;
 		}
@@ -222,9 +220,9 @@ static void cxgb4_process_flow_match(struct net_device *dev,
 }
 
 static int cxgb4_validate_flow_match(struct net_device *dev,
-				     struct tc_cls_flower_offload *cls)
+				     struct flow_cls_offload *cls)
 {
-	struct flow_rule *rule = tc_cls_flower_offload_flow_rule(cls);
+	struct flow_rule *rule = flow_cls_offload_flow_rule(cls);
 	struct flow_dissector *dissector = rule->match.dissector;
 	u16 ethtype_mask = 0;
 	u16 ethtype_key = 0;
@@ -352,12 +350,9 @@ static void process_pedit_field(struct ch_filter_specification *fs, u32 val,
 		switch (offset) {
 		case PEDIT_TCP_SPORT_DPORT:
 			if (~mask & PEDIT_TCP_UDP_SPORT_MASK)
-				offload_pedit(fs, cpu_to_be32(val) >> 16,
-					      cpu_to_be32(mask) >> 16,
-					      TCP_SPORT);
+				fs->nat_fport = val;
 			else
-				offload_pedit(fs, cpu_to_be32(val),
-					      cpu_to_be32(mask), TCP_DPORT);
+				fs->nat_lport = val >> 16;
 		}
 		fs->nat_mode = NAT_MODE_ALL;
 		break;
@@ -365,26 +360,22 @@ static void process_pedit_field(struct ch_filter_specification *fs, u32 val,
 		switch (offset) {
 		case PEDIT_UDP_SPORT_DPORT:
 			if (~mask & PEDIT_TCP_UDP_SPORT_MASK)
-				offload_pedit(fs, cpu_to_be32(val) >> 16,
-					      cpu_to_be32(mask) >> 16,
-					      UDP_SPORT);
+				fs->nat_fport = val;
 			else
-				offload_pedit(fs, cpu_to_be32(val),
-					      cpu_to_be32(mask), UDP_DPORT);
+				fs->nat_lport = val >> 16;
 		}
 		fs->nat_mode = NAT_MODE_ALL;
 	}
 }
 
-static void cxgb4_process_flow_actions(struct net_device *in,
-				       struct tc_cls_flower_offload *cls,
-				       struct ch_filter_specification *fs)
+void cxgb4_process_flow_actions(struct net_device *in,
+				struct flow_action *actions,
+				struct ch_filter_specification *fs)
 {
-	struct flow_rule *rule = tc_cls_flower_offload_flow_rule(cls);
 	struct flow_action_entry *act;
 	int i;
 
-	flow_action_for_each(i, act, &rule->action) {
+	flow_action_for_each(i, act, actions) {
 		switch (act->id) {
 		case FLOW_ACTION_ACCEPT:
 			fs->action = FILTER_PASS;
@@ -542,17 +533,20 @@ static bool valid_pedit_action(struct net_device *dev,
 	return true;
 }
 
-static int cxgb4_validate_flow_actions(struct net_device *dev,
-				       struct tc_cls_flower_offload *cls)
+int cxgb4_validate_flow_actions(struct net_device *dev,
+				struct flow_action *actions,
+				struct netlink_ext_ack *extack)
 {
-	struct flow_rule *rule = tc_cls_flower_offload_flow_rule(cls);
 	struct flow_action_entry *act;
 	bool act_redir = false;
 	bool act_pedit = false;
 	bool act_vlan = false;
 	int i;
 
-	flow_action_for_each(i, act, &rule->action) {
+	if (!flow_action_basic_hw_stats_check(actions, extack))
+		return -EOPNOTSUPP;
+
+	flow_action_for_each(i, act, actions) {
 		switch (act->id) {
 		case FLOW_ACTION_ACCEPT:
 		case FLOW_ACTION_DROP:
@@ -631,17 +625,77 @@ static int cxgb4_validate_flow_actions(struct net_device *dev,
 	return 0;
 }
 
-int cxgb4_tc_flower_replace(struct net_device *dev,
-			    struct tc_cls_flower_offload *cls)
+static void cxgb4_tc_flower_hash_prio_add(struct adapter *adap, u32 tc_prio)
 {
+	spin_lock_bh(&adap->tids.ftid_lock);
+	if (adap->tids.tc_hash_tids_max_prio < tc_prio)
+		adap->tids.tc_hash_tids_max_prio = tc_prio;
+	spin_unlock_bh(&adap->tids.ftid_lock);
+}
+
+static void cxgb4_tc_flower_hash_prio_del(struct adapter *adap, u32 tc_prio)
+{
+	struct tid_info *t = &adap->tids;
+	struct ch_tc_flower_entry *fe;
+	struct rhashtable_iter iter;
+	u32 found = 0;
+
+	spin_lock_bh(&t->ftid_lock);
+	/* Bail if the current rule is not the one with the max
+	 * prio.
+	 */
+	if (t->tc_hash_tids_max_prio != tc_prio)
+		goto out_unlock;
+
+	/* Search for the next rule having the same or next lower
+	 * max prio.
+	 */
+	rhashtable_walk_enter(&adap->flower_tbl, &iter);
+	do {
+		rhashtable_walk_start(&iter);
+
+		fe = rhashtable_walk_next(&iter);
+		while (!IS_ERR_OR_NULL(fe)) {
+			if (fe->fs.hash &&
+			    fe->fs.tc_prio <= t->tc_hash_tids_max_prio) {
+				t->tc_hash_tids_max_prio = fe->fs.tc_prio;
+				found++;
+
+				/* Bail if we found another rule
+				 * having the same prio as the
+				 * current max one.
+				 */
+				if (fe->fs.tc_prio == tc_prio)
+					break;
+			}
+
+			fe = rhashtable_walk_next(&iter);
+		}
+
+		rhashtable_walk_stop(&iter);
+	} while (fe == ERR_PTR(-EAGAIN));
+	rhashtable_walk_exit(&iter);
+
+	if (!found)
+		t->tc_hash_tids_max_prio = 0;
+
+out_unlock:
+	spin_unlock_bh(&t->ftid_lock);
+}
+
+int cxgb4_tc_flower_replace(struct net_device *dev,
+			    struct flow_cls_offload *cls)
+{
+	struct flow_rule *rule = flow_cls_offload_flow_rule(cls);
+	struct netlink_ext_ack *extack = cls->common.extack;
 	struct adapter *adap = netdev2adap(dev);
 	struct ch_tc_flower_entry *ch_flower;
 	struct ch_filter_specification *fs;
 	struct filter_ctx ctx;
-	int fidx;
-	int ret;
+	u8 inet_family;
+	int fidx, ret;
 
-	if (cxgb4_validate_flow_actions(dev, cls))
+	if (cxgb4_validate_flow_actions(dev, &rule->action, extack))
 		return -EOPNOTSUPP;
 
 	if (cxgb4_validate_flow_match(dev, cls))
@@ -656,19 +710,37 @@ int cxgb4_tc_flower_replace(struct net_device *dev,
 	fs = &ch_flower->fs;
 	fs->hitcnts = 1;
 	cxgb4_process_flow_match(dev, cls, fs);
-	cxgb4_process_flow_actions(dev, cls, fs);
+	cxgb4_process_flow_actions(dev, &rule->action, fs);
 
 	fs->hash = is_filter_exact_match(adap, fs);
-	if (fs->hash) {
-		fidx = 0;
-	} else {
-		fidx = cxgb4_get_free_ftid(dev, fs->type ? PF_INET6 : PF_INET);
-		if (fidx < 0) {
-			netdev_err(dev, "%s: No fidx for offload.\n", __func__);
-			ret = -ENOMEM;
-			goto free_entry;
-		}
+	inet_family = fs->type ? PF_INET6 : PF_INET;
+
+	/* Get a free filter entry TID, where we can insert this new
+	 * rule. Only insert rule if its prio doesn't conflict with
+	 * existing rules.
+	 */
+	fidx = cxgb4_get_free_ftid(dev, inet_family, fs->hash,
+				   cls->common.prio);
+	if (fidx < 0) {
+		NL_SET_ERR_MSG_MOD(extack,
+				   "No free LETCAM index available");
+		ret = -ENOMEM;
+		goto free_entry;
 	}
+
+	if (fidx < adap->tids.nhpftids) {
+		fs->prio = 1;
+		fs->hash = 0;
+	}
+
+	/* If the rule can be inserted into HASH region, then ignore
+	 * the index to normal FILTER region.
+	 */
+	if (fs->hash)
+		fidx = 0;
+
+	fs->tc_prio = cls->common.prio;
+	fs->tc_cookie = cls->cookie;
 
 	init_completion(&ctx.completion);
 	ret = __cxgb4_set_filter(dev, fidx, fs, &ctx);
@@ -687,11 +759,8 @@ int cxgb4_tc_flower_replace(struct net_device *dev,
 
 	ret = ctx.result;
 	/* Check if hw returned error for filter creation */
-	if (ret) {
-		netdev_err(dev, "%s: filter creation err %d\n",
-			   __func__, ret);
+	if (ret)
 		goto free_entry;
-	}
 
 	ch_flower->tc_flower_cookie = cls->cookie;
 	ch_flower->filter_id = ctx.tid;
@@ -699,6 +768,9 @@ int cxgb4_tc_flower_replace(struct net_device *dev,
 				     adap->flower_ht_params);
 	if (ret)
 		goto del_filter;
+
+	if (fs->hash)
+		cxgb4_tc_flower_hash_prio_add(adap, cls->common.prio);
 
 	return 0;
 
@@ -711,15 +783,20 @@ free_entry:
 }
 
 int cxgb4_tc_flower_destroy(struct net_device *dev,
-			    struct tc_cls_flower_offload *cls)
+			    struct flow_cls_offload *cls)
 {
 	struct adapter *adap = netdev2adap(dev);
 	struct ch_tc_flower_entry *ch_flower;
+	u32 tc_prio;
+	bool hash;
 	int ret;
 
 	ch_flower = ch_flower_lookup(adap, cls->cookie);
 	if (!ch_flower)
 		return -ENOENT;
+
+	hash = ch_flower->fs.hash;
+	tc_prio = ch_flower->fs.tc_prio;
 
 	ret = cxgb4_del_filter(dev, ch_flower->filter_id, &ch_flower->fs);
 	if (ret)
@@ -732,6 +809,9 @@ int cxgb4_tc_flower_destroy(struct net_device *dev,
 		goto err;
 	}
 	kfree_rcu(ch_flower, rcu);
+
+	if (hash)
+		cxgb4_tc_flower_hash_prio_del(adap, tc_prio);
 
 err:
 	return ret;
@@ -785,7 +865,7 @@ static void ch_flower_stats_cb(struct timer_list *t)
 }
 
 int cxgb4_tc_flower_stats(struct net_device *dev,
-			  struct tc_cls_flower_offload *cls)
+			  struct flow_cls_offload *cls)
 {
 	struct adapter *adap = netdev2adap(dev);
 	struct ch_tc_flower_stats *ofld_stats;
@@ -813,7 +893,8 @@ int cxgb4_tc_flower_stats(struct net_device *dev,
 			ofld_stats->last_used = jiffies;
 		flow_stats_update(&cls->stats, bytes - ofld_stats->byte_count,
 				  packets - ofld_stats->packet_count,
-				  ofld_stats->last_used);
+				  ofld_stats->last_used,
+				  FLOW_ACTION_HW_STATS_IMMEDIATE);
 
 		ofld_stats->packet_count = packets;
 		ofld_stats->byte_count = bytes;

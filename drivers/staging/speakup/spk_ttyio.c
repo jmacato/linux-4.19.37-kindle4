@@ -47,11 +47,11 @@ static int spk_ttyio_ldisc_open(struct tty_struct *tty)
 {
 	struct spk_ldisc_data *ldisc_data;
 
-	if (tty->ops->write == NULL)
+	if (!tty->ops->write)
 		return -EOPNOTSUPP;
 	speakup_tty = tty;
 
-	ldisc_data = kmalloc(sizeof(struct spk_ldisc_data), GFP_KERNEL);
+	ldisc_data = kmalloc(sizeof(*ldisc_data), GFP_KERNEL);
 	if (!ldisc_data)
 		return -ENOMEM;
 

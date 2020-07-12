@@ -1,12 +1,9 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * ACPI AML interfacing support
  *
  * Copyright (C) 2015, Intel Corporation
  * Authors: Lv Zheng <lv.zheng@intel.com>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
  */
 
 /* #define DEBUG */
@@ -390,7 +387,7 @@ again:
 	return size > 0 ? size : ret;
 }
 
-static int acpi_aml_thread(void *unsed)
+static int acpi_aml_thread(void *unused)
 {
 	acpi_osd_exec_callback function = NULL;
 	void *context;
@@ -748,7 +745,7 @@ static const struct acpi_debugger_ops acpi_aml_debugger = {
 	.notify_command_complete = acpi_aml_notify_command_complete,
 };
 
-int __init acpi_aml_init(void)
+static int __init acpi_aml_init(void)
 {
 	int ret;
 
@@ -774,7 +771,7 @@ int __init acpi_aml_init(void)
 	return 0;
 }
 
-void __exit acpi_aml_exit(void)
+static void __exit acpi_aml_exit(void)
 {
 	if (acpi_aml_initialized) {
 		acpi_unregister_debugger(&acpi_aml_debugger);

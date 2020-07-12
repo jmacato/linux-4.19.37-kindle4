@@ -22,11 +22,10 @@
  * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
  * DEALINGS IN THE SOFTWARE.
  */
-#include <linux/pm_runtime.h>
-
-#include <drm/drmP.h>
 #include <drm/drm_crtc_helper.h>
+#include <drm/drm_fourcc.h>
 #include <drm/drm_plane_helper.h>
+#include <drm/drm_vblank.h>
 
 #include "nouveau_drv.h"
 #include "nouveau_reg.h"
@@ -606,15 +605,16 @@ static int
 nv_crtc_swap_fbs(struct drm_crtc *crtc, struct drm_framebuffer *old_fb)
 {
 	struct nv04_display *disp = nv04_display(crtc->dev);
-	struct nouveau_framebuffer *nvfb = nouveau_framebuffer(crtc->primary->fb);
+	struct drm_framebuffer *fb = crtc->primary->fb;
+	struct nouveau_bo *nvbo = nouveau_gem_object(fb->obj[0]);
 	struct nouveau_crtc *nv_crtc = nouveau_crtc(crtc);
 	int ret;
 
-	ret = nouveau_bo_pin(nvfb->nvbo, TTM_PL_FLAG_VRAM, false);
+	ret = nouveau_bo_pin(nvbo, TTM_PL_FLAG_VRAM, false);
 	if (ret == 0) {
 		if (disp->image[nv_crtc->index])
 			nouveau_bo_unpin(disp->image[nv_crtc->index]);
-		nouveau_bo_ref(nvfb->nvbo, &disp->image[nv_crtc->index]);
+		nouveau_bo_ref(nvbo, &disp->image[nv_crtc->index]);
 	}
 
 	return ret;
@@ -823,8 +823,8 @@ nv04_crtc_do_mode_set_base(struct drm_crtc *crtc,
 	struct drm_device *dev = crtc->dev;
 	struct nouveau_drm *drm = nouveau_drm(dev);
 	struct nv04_crtc_reg *regp = &nv04_display(dev)->mode_reg.crtc_reg[nv_crtc->index];
+	struct nouveau_bo *nvbo;
 	struct drm_framebuffer *drm_fb;
-	struct nouveau_framebuffer *fb;
 	int arb_burst, arb_lwm;
 
 	NV_DEBUG(drm, "index %d\n", nv_crtc->index);
@@ -840,13 +840,12 @@ nv04_crtc_do_mode_set_base(struct drm_crtc *crtc,
 	 */
 	if (atomic) {
 		drm_fb = passed_fb;
-		fb = nouveau_framebuffer(passed_fb);
 	} else {
 		drm_fb = crtc->primary->fb;
-		fb = nouveau_framebuffer(crtc->primary->fb);
 	}
 
-	nv_crtc->fb.offset = fb->nvbo->bo.offset;
+	nvbo = nouveau_gem_object(drm_fb->obj[0]);
+	nv_crtc->fb.offset = nvbo->bo.offset;
 
 	if (nv_crtc->lut.depth != drm_fb->format->depth) {
 		nv_crtc->lut.depth = drm_fb->format->depth;
@@ -1031,53 +1030,6 @@ nv04_crtc_cursor_move(struct drm_crtc *crtc, int x, int y)
 	return 0;
 }
 
-static int
-nouveau_crtc_set_config(struct drm_mode_set *set,
-			struct drm_modeset_acquire_ctx *ctx)
-{
-	struct drm_device *dev;
-	struct nouveau_drm *drm;
-	int ret;
-	struct drm_crtc *crtc;
-	bool active = false;
-	if (!set || !set->crtc)
-		return -EINVAL;
-
-	dev = set->crtc->dev;
-
-	/* get a pm reference here */
-	ret = pm_runtime_get_sync(dev->dev);
-	if (ret < 0 && ret != -EACCES)
-		return ret;
-
-	ret = drm_crtc_helper_set_config(set, ctx);
-
-	drm = nouveau_drm(dev);
-
-	/* if we get here with no crtcs active then we can drop a reference */
-	list_for_each_entry(crtc, &dev->mode_config.crtc_list, head) {
-		if (crtc->enabled)
-			active = true;
-	}
-
-	pm_runtime_mark_last_busy(dev->dev);
-	/* if we have active crtcs and we don't have a power ref,
-	   take the current one */
-	if (active && !drm->have_disp_power_ref) {
-		drm->have_disp_power_ref = true;
-		return ret;
-	}
-	/* if we have no active crtcs, then drop the power ref
-	   we got before */
-	if (!active && drm->have_disp_power_ref) {
-		pm_runtime_put_autosuspend(dev->dev);
-		drm->have_disp_power_ref = false;
-	}
-	/* drop the power reference we got coming in here */
-	pm_runtime_put_autosuspend(dev->dev);
-	return ret;
-}
-
 struct nv04_page_flip_state {
 	struct list_head head;
 	struct drm_pending_vblank_event *event;
@@ -1191,8 +1143,9 @@ nv04_crtc_page_flip(struct drm_crtc *crtc, struct drm_framebuffer *fb,
 	const int swap_interval = (flags & DRM_MODE_PAGE_FLIP_ASYNC) ? 0 : 1;
 	struct drm_device *dev = crtc->dev;
 	struct nouveau_drm *drm = nouveau_drm(dev);
-	struct nouveau_bo *old_bo = nouveau_framebuffer(crtc->primary->fb)->nvbo;
-	struct nouveau_bo *new_bo = nouveau_framebuffer(fb)->nvbo;
+	struct drm_framebuffer *old_fb = crtc->primary->fb;
+	struct nouveau_bo *old_bo = nouveau_gem_object(old_fb->obj[0]);
+	struct nouveau_bo *new_bo = nouveau_gem_object(fb->obj[0]);
 	struct nv04_page_flip_state *s;
 	struct nouveau_channel *chan;
 	struct nouveau_cli *cli;
@@ -1293,9 +1246,12 @@ static const struct drm_crtc_funcs nv04_crtc_funcs = {
 	.cursor_set = nv04_crtc_cursor_set,
 	.cursor_move = nv04_crtc_cursor_move,
 	.gamma_set = nv_crtc_gamma_set,
-	.set_config = nouveau_crtc_set_config,
+	.set_config = drm_crtc_helper_set_config,
 	.page_flip = nv04_crtc_page_flip,
 	.destroy = nv_crtc_destroy,
+	.enable_vblank = nouveau_display_vblank_enable,
+	.disable_vblank = nouveau_display_vblank_disable,
+	.get_vblank_timestamp = drm_crtc_vblank_helper_get_vblank_timestamp,
 };
 
 static const struct drm_crtc_helper_funcs nv04_crtc_helper_funcs = {
@@ -1306,6 +1262,7 @@ static const struct drm_crtc_helper_funcs nv04_crtc_helper_funcs = {
 	.mode_set_base = nv04_crtc_mode_set_base,
 	.mode_set_base_atomic = nv04_crtc_mode_set_base_atomic,
 	.disable = nv_crtc_disable,
+	.get_scanout_position = nouveau_display_scanoutpos,
 };
 
 static const uint32_t modeset_formats[] = {

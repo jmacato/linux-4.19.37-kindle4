@@ -48,7 +48,7 @@ struct videomode;
  * @MODE_HSYNC: hsync out of range
  * @MODE_VSYNC: vsync out of range
  * @MODE_H_ILLEGAL: mode has illegal horizontal timings
- * @MODE_V_ILLEGAL: mode has illegal horizontal timings
+ * @MODE_V_ILLEGAL: mode has illegal vertical timings
  * @MODE_BAD_WIDTH: requires an unsupported linepitch
  * @MODE_NOMODE: no mode with a matching name
  * @MODE_NO_INTERLACE: interlaced mode not supported
@@ -137,6 +137,23 @@ enum drm_mode_status {
 	.htotal = (ht), .hskew = (hsk), .vdisplay = (vd), \
 	.vsync_start = (vss), .vsync_end = (vse), .vtotal = (vt), \
 	.vscan = (vs), .flags = (f)
+
+/**
+ * DRM_SIMPLE_MODE - Simple display mode
+ * @hd: Horizontal resolution, width
+ * @vd: Vertical resolution, height
+ * @hd_mm: Display width in millimeters
+ * @vd_mm: Display height in millimeters
+ *
+ * This macro initializes a &drm_display_mode that only contains info about
+ * resolution and physical size.
+ */
+#define DRM_SIMPLE_MODE(hd, vd, hd_mm, vd_mm) \
+	.type = DRM_MODE_TYPE_DRIVER, .clock = 1 /* pass validation */, \
+	.hdisplay = (hd), .hsync_start = (hd), .hsync_end = (hd), \
+	.htotal = (hd), .vdisplay = (vd), .vsync_start = (vd), \
+	.vsync_end = (vd), .vtotal = (vd), .width_mm = (hd_mm), \
+	.height_mm = (vd_mm)
 
 #define CRTC_INTERLACE_HALVE_V	(1 << 0) /* halve V values for interlacing */
 #define CRTC_STEREO_DOUBLE	(1 << 1) /* adjust timings for stereo modes */
@@ -354,19 +371,12 @@ struct drm_display_mode {
 	int crtc_vtotal;
 
 	/**
-	 * @private:
+	 * @private_flags:
 	 *
-	 * Pointer for driver private data. This can only be used for mode
+	 * Driver private flags. private_flags can only be used for mode
 	 * objects passed to drivers in modeset operations. It shouldn't be used
 	 * by atomic drivers since they can store any additional data by
 	 * subclassing state structures.
-	 */
-	int *private;
-
-	/**
-	 * @private_flags:
-	 *
-	 * Similar to @private, but just an integer.
 	 */
 	int private_flags;
 
@@ -379,16 +389,6 @@ struct drm_display_mode {
 	 * This value is in Hz.
 	 */
 	int vrefresh;
-
-	/**
-	 * @hsync:
-	 *
-	 * Horizontal refresh rate, for debug output in human readable form. Not
-	 * used in a functional way.
-	 *
-	 * This value is in kHz.
-	 */
-	int hsync;
 
 	/**
 	 * @picture_aspect_ratio:
@@ -483,7 +483,6 @@ int of_get_drm_display_mode(struct device_node *np,
 			    int index);
 
 void drm_mode_set_name(struct drm_display_mode *mode);
-int drm_mode_hsync(const struct drm_display_mode *mode);
 int drm_mode_vrefresh(const struct drm_display_mode *mode);
 void drm_mode_get_hv_timing(const struct drm_display_mode *mode,
 			    int *hdisplay, int *vdisplay);
@@ -520,7 +519,7 @@ void drm_connector_list_update(struct drm_connector *connector);
 /* parsing cmdline modes */
 bool
 drm_mode_parse_command_line_for_connector(const char *mode_option,
-					  struct drm_connector *connector,
+					  const struct drm_connector *connector,
 					  struct drm_cmdline_mode *mode);
 struct drm_display_mode *
 drm_mode_create_from_cmdline_mode(struct drm_device *dev,

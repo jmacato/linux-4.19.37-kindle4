@@ -13,7 +13,7 @@
 
 static void cb_fini(struct hl_device *hdev, struct hl_cb *cb)
 {
-	hdev->asic_funcs->dma_free_coherent(hdev, cb->size,
+	hdev->asic_funcs->asic_dma_free_coherent(hdev, cb->size,
 			(void *) (uintptr_t) cb->kernel_address,
 			cb->bus_address);
 	kfree(cb);
@@ -66,10 +66,10 @@ static struct hl_cb *hl_cb_alloc(struct hl_device *hdev, u32 cb_size,
 		return NULL;
 
 	if (ctx_id == HL_KERNEL_ASID_ID)
-		p = hdev->asic_funcs->dma_alloc_coherent(hdev, cb_size,
+		p = hdev->asic_funcs->asic_dma_alloc_coherent(hdev, cb_size,
 						&cb->bus_address, GFP_ATOMIC);
 	else
-		p = hdev->asic_funcs->dma_alloc_coherent(hdev, cb_size,
+		p = hdev->asic_funcs->asic_dma_alloc_coherent(hdev, cb_size,
 						&cb->bus_address,
 						GFP_USER | __GFP_ZERO);
 	if (!p) {
@@ -105,10 +105,9 @@ int hl_cb_create(struct hl_device *hdev, struct hl_cb_mgr *mgr,
 		goto out_err;
 	}
 
-	if (cb_size > HL_MAX_CB_SIZE) {
-		dev_err(hdev->dev,
-			"CB size %d must be less then %d\n",
-			cb_size, HL_MAX_CB_SIZE);
+	if (cb_size > SZ_2M) {
+		dev_err(hdev->dev, "CB size %d must be less than %d\n",
+			cb_size, SZ_2M);
 		rc = -EINVAL;
 		goto out_err;
 	}
@@ -211,20 +210,38 @@ int hl_cb_ioctl(struct hl_fpriv *hpriv, void *data)
 {
 	union hl_cb_args *args = data;
 	struct hl_device *hdev = hpriv->hdev;
-	u64 handle;
+	u64 handle = 0;
 	int rc;
+
+	if (hl_device_disabled_or_in_reset(hdev)) {
+		dev_warn_ratelimited(hdev->dev,
+			"Device is %s. Can't execute CB IOCTL\n",
+			atomic_read(&hdev->in_reset) ? "in_reset" : "disabled");
+		return -EBUSY;
+	}
 
 	switch (args->in.op) {
 	case HL_CB_OP_CREATE:
-		rc = hl_cb_create(hdev, &hpriv->cb_mgr, args->in.cb_size,
-					&handle, hpriv->ctx->asid);
+		if (args->in.cb_size > HL_MAX_CB_SIZE) {
+			dev_err(hdev->dev,
+				"User requested CB size %d must be less than %d\n",
+				args->in.cb_size, HL_MAX_CB_SIZE);
+			rc = -EINVAL;
+		} else {
+			rc = hl_cb_create(hdev, &hpriv->cb_mgr,
+						args->in.cb_size, &handle,
+						hpriv->ctx->asid);
+		}
+
 		memset(args, 0, sizeof(*args));
 		args->out.cb_handle = handle;
 		break;
+
 	case HL_CB_OP_DESTROY:
 		rc = hl_cb_destroy(hdev, &hpriv->cb_mgr,
 					args->in.cb_handle);
 		break;
+
 	default:
 		rc = -ENOTTY;
 		break;
@@ -271,7 +288,7 @@ int hl_cb_mmap(struct hl_fpriv *hpriv, struct vm_area_struct *vma)
 	cb = hl_cb_get(hdev, &hpriv->cb_mgr, handle);
 	if (!cb) {
 		dev_err(hdev->dev,
-			"CB mmap failed, no match to handle %d\n", handle);
+			"CB mmap failed, no match to handle 0x%x\n", handle);
 		return -EINVAL;
 	}
 
@@ -340,7 +357,7 @@ struct hl_cb *hl_cb_get(struct hl_device *hdev, struct hl_cb_mgr *mgr,
 	if (!cb) {
 		spin_unlock(&mgr->cb_lock);
 		dev_warn(hdev->dev,
-			"CB get failed, no match to handle %d\n", handle);
+			"CB get failed, no match to handle 0x%x\n", handle);
 		return NULL;
 	}
 
@@ -390,7 +407,8 @@ struct hl_cb *hl_cb_kernel_create(struct hl_device *hdev, u32 cb_size)
 	rc = hl_cb_create(hdev, &hdev->kernel_cb_mgr, cb_size, &cb_handle,
 			HL_KERNEL_ASID_ID);
 	if (rc) {
-		dev_err(hdev->dev, "Failed to allocate CB for KMD %d\n", rc);
+		dev_err(hdev->dev,
+			"Failed to allocate CB for the kernel driver %d\n", rc);
 		return NULL;
 	}
 

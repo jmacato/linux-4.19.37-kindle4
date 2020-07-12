@@ -39,7 +39,6 @@
 #include <asm/fpu.h>
 #include <asm/mipsregs.h>
 #include <asm/mipsmtregs.h>
-#include <asm/pgtable.h>
 #include <asm/page.h>
 #include <asm/processor.h>
 #include <asm/syscall.h>
@@ -1418,7 +1417,7 @@ asmlinkage long syscall_trace_enter(struct pt_regs *regs, long syscall)
 		unsigned long args[6];
 
 		sd.nr = syscall;
-		sd.arch = syscall_get_arch();
+		sd.arch = syscall_get_arch(current);
 		syscall_get_arguments(current, regs, args);
 		for (i = 0; i < 6; i++)
 			sd.args[i] = args[i];
